@@ -965,6 +965,54 @@ LLaMA选择RoPE的原因：
 
 ---
 
+## 学习问答
+
+### 核心概念问答
+
+#### 1. Encoder与Decoder的核心差异
+**问**：Encoder和Decoder的主要区别是什么？
+**答**：
+- **功能定位**：Encoder负责理解输入序列（双向上下文），Decoder负责生成输出序列（自回归+编码器信息）
+- **注意力机制**：Encoder使用双向自注意力（可关注所有位置），Decoder使用掩码自注意力（仅关注历史位置）+交叉注意力（关注Encoder输出）
+- **典型应用**：Encoder用于文本理解（如BERT），Decoder用于文本生成（如GPT）
+
+#### 2. Dropout的作用
+**问**：什么是Dropout？为什么需要它？
+**答**：
+- **定义**：训练时随机将部分神经元输出置为0的正则化技术
+- **作用**：防止过拟合，减少神经元共适应，模拟集成学习效果
+- **应用**：在注意力层、FFN层和嵌入层添加，推理时关闭
+
+#### 3. 位置编码的必要性
+**问**：Transformer为什么需要位置编码？
+**答**：
+- Transformer的自注意力机制是置换不变的，无法区分token顺序
+- 位置编码通过注入位置信息，让模型理解序列顺序
+- 主流方案：正弦余弦编码、RoPE（旋转位置编码）、ALiBi（线性偏置编码）
+
+### 多头注意力细节
+
+#### 4. W_o参数的作用
+**问**：Multi-Head Attention公式中的W_o是什么？
+**答**：
+- **定义**：输出投影矩阵（Output Projection Matrix）
+- **作用**：将多头拼接结果映射回d_model维度，实现多头信息融合
+- **维度**：(h×d_v, d_model)，其中h是头数，d_v是每个头的维度
+
+#### 5. 维度转置的逻辑
+**问**：为什么需要`Q.view(seq_len, num_heads, d_k).transpose(0, 1)`操作？
+**答**：
+- **view操作**：将d_model拆分为(num_heads, d_k)，保证同一token的特征被分配到不同头
+- **transpose操作**：将num_heads维度提前，实现多头并行计算
+- **内存布局**：确保数据连续存储，便于高效计算
+
+#### 6. contiguous()的作用
+**问**：为什么transpose后需要contiguous()才能view？
+**答**：
+- transpose会导致Tensor内存非连续，view操作要求内存连续
+- contiguous()重新排列内存，使数据连续存储
+- 示例：`heads.transpose(0,1).contiguous().view(seq_len, d_model)`
+
 ## Day 7: 本周复盘 + 自测
 
 ### 学习任务
