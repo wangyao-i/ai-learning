@@ -189,6 +189,9 @@ class BlockManager:
         # 每个序列的Block表
         self.block_tables: Dict[int, List[int]] = {}
         
+        # 每个序列已分配的token数量 (关键：追踪实际token数)
+        self.seq_num_tokens: Dict[int, int] = {}
+        
         # 引用计数
         self.ref_counts: Dict[int, int] = {}
     
@@ -199,28 +202,32 @@ class BlockManager:
         Returns:
             (block_id, slot_offset): 物理Block ID和slot偏移
         """
-        # 1. 获取序列的Block表
+        # 1. 初始化序列状态
         if seq_id not in self.block_tables:
             self.block_tables[seq_id] = []
+            self.seq_num_tokens[seq_id] = 0
             
         block_table = self.block_tables[seq_id]
+        num_tokens = self.seq_num_tokens[seq_id]
         
-        # 2. 计算当前token位置
-        token_position = len(block_table) * self.block_size
+        # 2. 计算slot偏移 (当前Block中的位置)
+        slot_offset = num_tokens % self.block_size
         
         # 3. 检查是否需要分配新Block
-        if len(block_table) == 0 or token_position % self.block_size == 0:
+        # 当 slot_offset == 0 且 num_tokens > 0 时，说明当前Block已满
+        # 当 block_table 为空时，需要分配第一个Block
+        if len(block_table) == 0 or slot_offset == 0:
             # 分配新的物理Block
             block_id = self.gpu_allocator.allocate()
             block_table.append(block_id)
             self.ref_counts[block_id] = 1
         else:
-            # 使用最后一个Block
+            # 使用最后一个Block (Block还有空闲slot)
             block_id = block_table[-1]
-            
-        # 4. 计算slot偏移
-        slot_offset = token_position % self.block_size
         
+        # 4. 更新token计数
+        self.seq_num_tokens[seq_id] += 1
+            
         return block_id, slot_offset
     
     def fork(self, parent_seq_id: int, child_seq_id: int):
@@ -263,16 +270,76 @@ class BlockManager:
 
 ### 3.2 PagedAttention Kernel实现
 
+#### 变量含义详解
+
+**核心概念：连续批处理（Continuous Batching）**
+
+在vLLM中，多个序列的token会被"打包"在一起处理，而不是传统的固定batch维度：
+
+```
+传统批处理:
+  batch_size = 4, seq_len = 10
+  input: [batch_size, seq_len, ...] = [4, 10, ...]
+  
+vLLM连续批处理:
+  num_seqs = 4 (4个序列并行)
+  但每个序列长度不同！
+  seq1: 10 tokens
+  seq2: 15 tokens  
+  seq3: 8 tokens
+  seq4: 12 tokens
+  num_tokens = 10 + 15 + 8 + 12 = 45 (所有token打包在一起)
+```
+
+**变量对照表：**
+
+| 变量 | 形状 | 含义 | 说明 |
+|------|------|------|------|
+| `num_tokens` | 标量 | **所有序列的token总数** | 不是batch_size！是所有序列token打包后的总数 |
+| `num_seqs` | 标量 | **序列数量** | 类似batch_size，但每个序列长度不同 |
+| `num_blocks` | 标量 | 物理Block总数 | KV Cache的总Block数量 |
+| `block_tables` | `[num_seqs, max_blocks]` | 每个序列的Block映射表 | 每行是一个序列的Block ID列表 |
+| `context_lens` | `[num_seqs]` | 每个序列的上下文长度 | 每个序列有多少个历史token |
+
+**图解示例：**
+
+```
+假设: num_seqs = 3, block_size = 4
+
+序列状态:
+┌─────────────────────────────────────────────────────────┐
+│ Seq 0: "Hello world!"        → 3 tokens, context_len=3 │
+│ Seq 1: "How are you doing?"  → 5 tokens, context_len=5 │
+│ Seq 2: "Hi"                  → 1 token,  context_len=1 │
+└─────────────────────────────────────────────────────────┘
+
+num_tokens = 3 + 5 + 1 = 9  (所有token打包在一起)
+
+query.shape = [9, num_heads, head_dim]  ← 注意是9，不是3！
+
+context_lens = [3, 5, 1]  ← 每个序列的长度
+
+block_tables:
+┌─────────────────────────────┐
+│ Seq 0: [Block_5, Block_8]   │  ← 3 tokens需要1个Block(部分填充)
+│ Seq 1: [Block_2, Block_7]   │  ← 5 tokens需要2个Block
+│ Seq 2: [Block_1]            │  ← 1 token需要1个Block(部分填充)
+└─────────────────────────────┘
+block_tables.shape = [3, 2]  ← [num_seqs, max_num_blocks_per_seq]
+```
+
+#### Kernel实现代码
+
 ```python
 def paged_attention_kernel(
-    query: torch.Tensor,           # [num_tokens, num_heads, head_dim]
-    key_cache: torch.Tensor,       # [num_blocks, block_size, num_heads, head_dim]
-    value_cache: torch.Tensor,     # [num_blocks, block_size, num_heads, head_dim]
-    block_tables: torch.Tensor,    # [num_seqs, max_num_blocks_per_seq]
-    context_lens: torch.Tensor,    # [num_seqs]
-    scale: float,
-    block_size: int,
-    max_context_len: int,
+    query: torch.Tensor,           # [num_tokens, num_heads, head_dim] - 所有序列的token打包
+    key_cache: torch.Tensor,       # [num_blocks, block_size, num_heads, head_dim] - KV缓存块
+    value_cache: torch.Tensor,     # [num_blocks, block_size, num_heads, head_dim] - KV缓存块
+    block_tables: torch.Tensor,    # [num_seqs, max_num_blocks_per_seq] - 序列到Block的映射
+    context_lens: torch.Tensor,    # [num_seqs] - 每个序列的上下文长度
+    scale: float,                  # attention缩放因子 = 1/sqrt(head_dim)
+    block_size: int,               # 每个Block的token容量
+    max_context_len: int,          # 最大上下文长度
 ) -> torch.Tensor:
     """
     PagedAttention核心kernel
@@ -281,9 +348,13 @@ def paged_attention_kernel(
     1. 根据block_tables找到每个token对应的物理Block
     2. 在Block内计算attention
     3. 跨Block聚合结果
+    
+    注意：num_tokens是所有序列token的总和，不是batch_size！
+         num_seqs才是序列数量（类似batch_size）
+         context_lens记录每个序列的历史长度
     """
     
-    num_tokens = query.shape[0]
+    num_tokens = query.shape[0]  # 所有token总数
     num_heads = query.shape[1]
     head_dim = query.shape[2]
     
@@ -483,6 +554,353 @@ async def swap_blocks_async(block_ids: List[int], src_device: str, dst_device: s
     for block_id in block_ids:
         block = get_block(block_id)
         block.to(dst_device, non_blocking=True)
+```
+
+### 4.4 KV Cache更新逻辑
+
+KV Cache更新是PagedAttention的核心操作，发生在每次推理迭代后。
+
+#### 更新时机
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    KV Cache 更新时机                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Prefill阶段:                                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 输入: "Hello world!"                                     │   │
+│  │ 处理: 一次性计算所有token的K/V                           │   │
+│  │ 更新: 将所有K/V写入Block                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Decode阶段:                                                    │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 输入: 新生成的1个token                                   │   │
+│  │ 处理: 计算1个token的K/V                                  │   │
+│  │ 更新: 将新K/V追加到Block                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 核心更新代码
+
+```python
+class KVCacheUpdater:
+    """
+    KV Cache更新器
+    
+    负责：
+    1. 将新计算的K/V写入对应的Block slot
+    2. 处理跨Block的连续写入
+    3. 支持批量更新
+    """
+    
+    def __init__(self, block_size: int, num_layers: int):
+        self.block_size = block_size
+        self.num_layers = num_layers
+    
+    def update_kv_cache(
+        self,
+        key: torch.Tensor,           # [num_tokens, num_heads, head_dim]
+        value: torch.Tensor,         # [num_tokens, num_heads, head_dim]
+        key_cache: torch.Tensor,     # [num_blocks, block_size, num_heads, head_dim]
+        value_cache: torch.Tensor,   # [num_blocks, block_size, num_heads, head_dim]
+        block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+        slot_mapping: torch.Tensor,  # [num_tokens] - 每个token对应的slot位置
+    ):
+        """
+        更新KV Cache
+        
+        slot_mapping: 每个token应该写入的slot位置
+            - slot = block_id * block_size + slot_offset
+            - 由BlockManager在allocate_slot时确定
+        """
+        num_tokens = key.shape[0]
+        
+        # 方法1: 使用scatter操作批量写入 (推荐，高效)
+        # 将key/value按slot_mapping写入cache
+        self._scatter_update(key, key_cache, slot_mapping)
+        self._scatter_update(value, value_cache, slot_mapping)
+    
+    def _scatter_update(
+        self,
+        src: torch.Tensor,      # [num_tokens, num_heads, head_dim]
+        cache: torch.Tensor,    # [num_blocks, block_size, num_heads, head_dim]
+        slot_mapping: torch.Tensor,  # [num_tokens]
+    ):
+        """
+        使用scatter操作更新cache
+        
+        原理：
+        1. 将cache展平为 [num_blocks * block_size, num_heads, head_dim]
+        2. 使用slot_mapping作为索引，将src写入对应位置
+        """
+        num_blocks, block_size, num_heads, head_dim = cache.shape
+        
+        # 展平cache: [num_blocks * block_size, num_heads, head_dim]
+        cache_flat = cache.view(-1, num_heads, head_dim)
+        
+        # 扩展slot_mapping用于scatter: [num_tokens, num_heads, head_dim]
+        slot_mapping_expanded = slot_mapping.unsqueeze(-1).unsqueeze(-1)
+        slot_mapping_expanded = slot_mapping_expanded.expand(-1, num_heads, head_dim)
+        
+        # Scatter写入
+        cache_flat.scatter_(0, slot_mapping_expanded, src)
+```
+
+#### 完整更新流程
+
+```python
+class CacheEngine:
+    """
+    完整的Cache引擎，管理KV Cache的分配、更新、释放
+    """
+    
+    def __init__(
+        self,
+        block_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        num_gpu_blocks: int,
+    ):
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        
+        # 为每层分配KV Cache
+        # shape: [num_blocks, block_size, num_heads, head_dim]
+        self.gpu_cache = [
+            torch.zeros(
+                num_gpu_blocks, block_size, num_heads, head_dim,
+                dtype=torch.float16,
+                device='cuda'
+            )
+            for _ in range(num_layers * 2)  # K和V各num_layers个
+        ]
+        
+        # Block Manager
+        self.block_manager = BlockManager(
+            block_size=block_size,
+            num_gpu_blocks=num_gpu_blocks
+        )
+    
+    def update(
+        self,
+        seq_ids: List[int],
+        new_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+    ):
+        """
+        更新指定序列的KV Cache
+        
+        Args:
+            seq_ids: 序列ID列表
+            new_key_values: 每层的新K/V，每个元素是 (key, value) 元组
+                           key/value shape: [num_new_tokens, num_heads, head_dim]
+        """
+        # 1. 为新token分配slot
+        slot_mapping = []
+        for seq_id in seq_ids:
+            # 获取该序列需要分配的slot数量
+            num_new_tokens = new_key_values[0][0].shape[0]
+            
+            for _ in range(num_new_tokens):
+                block_id, slot_offset = self.block_manager.allocate_slot(seq_id)
+                # 计算全局slot索引
+                slot = block_id * self.block_size + slot_offset
+                slot_mapping.append(slot)
+        
+        slot_mapping = torch.tensor(slot_mapping, device='cuda')
+        
+        # 2. 更新每层的KV Cache
+        for layer_idx, (key, value) in enumerate(new_key_values):
+            # K cache的索引
+            k_cache = self.gpu_cache[layer_idx * 2]
+            # V cache的索引
+            v_cache = self.gpu_cache[layer_idx * 2 + 1]
+            
+            # 写入cache
+            self._scatter_update(key, k_cache, slot_mapping)
+            self._scatter_update(value, v_cache, slot_mapping)
+    
+    def _scatter_update(self, src, cache, slot_mapping):
+        """Scatter写入"""
+        num_blocks, block_size, num_heads, head_dim = cache.shape
+        cache_flat = cache.view(-1, num_heads, head_dim)
+        
+        slot_mapping_expanded = slot_mapping.unsqueeze(-1).unsqueeze(-1)
+        slot_mapping_expanded = slot_mapping_expanded.expand(-1, num_heads, head_dim)
+        
+        cache_flat.scatter_(0, slot_mapping_expanded, src)
+```
+
+#### Prefill阶段的批量更新
+
+```python
+def update_cache_for_prefill(
+    self,
+    seq_id: int,
+    input_tokens: List[int],
+    key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+):
+    """
+    Prefill阶段的KV Cache更新
+    
+    特点：
+    1. 一次性写入大量token
+    2. 需要分配多个Block
+    3. 可能跨Block边界
+    """
+    num_tokens = len(input_tokens)
+    num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
+    
+    # 1. 批量分配Block
+    block_ids = []
+    for _ in range(num_blocks_needed):
+        block_id = self.block_manager.gpu_allocator.allocate()
+        block_ids.append(block_id)
+    
+    self.block_manager.block_tables[seq_id] = block_ids
+    
+    # 2. 计算slot_mapping
+    slot_mapping = []
+    for i in range(num_tokens):
+        block_idx = i // self.block_size
+        slot_offset = i % self.block_size
+        block_id = block_ids[block_idx]
+        slot = block_id * self.block_size + slot_offset
+        slot_mapping.append(slot)
+    
+    slot_mapping = torch.tensor(slot_mapping, device='cuda')
+    
+    # 3. 批量写入KV Cache
+    for layer_idx, (key, value) in enumerate(key_values):
+        k_cache = self.gpu_cache[layer_idx * 2]
+        v_cache = self.gpu_cache[layer_idx * 2 + 1]
+        
+        self._scatter_update(key, k_cache, slot_mapping)
+        self._scatter_update(value, v_cache, slot_mapping)
+```
+
+#### Decode阶段的增量更新
+
+```python
+def update_cache_for_decode(
+    self,
+    seq_id: int,
+    new_key: torch.Tensor,   # [1, num_heads, head_dim]
+    new_value: torch.Tensor, # [1, num_heads, head_dim]
+    layer_idx: int,
+):
+    """
+    Decode阶段的KV Cache更新
+    
+    特点：
+    1. 每次只更新1个token
+    2. 通常复用最后一个Block的空闲slot
+    3. Block满时才分配新Block
+    """
+    # 1. 分配一个slot
+    block_id, slot_offset = self.block_manager.allocate_slot(seq_id)
+    
+    # 2. 计算全局slot索引
+    slot = block_id * self.block_size + slot_offset
+    
+    # 3. 写入对应位置
+    k_cache = self.gpu_cache[layer_idx * 2]
+    v_cache = self.gpu_cache[layer_idx * 2 + 1]
+    
+    # 直接写入指定slot
+    k_cache[block_id, slot_offset] = new_key[0]
+    v_cache[block_id, slot_offset] = new_value[0]
+```
+
+#### 更新流程图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    KV Cache 更新完整流程                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Step 1: 模型前向传播                                     │   │
+│  │         输入token → Transformer → 输出K/V               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Step 2: 分配slot                                         │   │
+│  │         BlockManager.allocate_slot() → (block_id, offset)│   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Step 3: 计算slot_mapping                                 │   │
+│  │         slot = block_id * block_size + offset            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Step 4: Scatter写入                                      │   │
+│  │         cache[slot] = K/V                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Step 5: 更新Block Table                                  │   │
+│  │         记录序列到Block的映射                            │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 性能优化技巧
+
+```python
+# 优化1: 使用paged attention kernel直接写入
+def update_with_kernel(
+    self,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    """
+    使用CUDA kernel直接写入，避免Python开销
+    """
+    # vLLM中的实现使用自定义CUDA kernel
+    # ops.reshape_and_cache(key, value, cache, slot_mapping)
+    pass
+
+# 优化2: 批量更新多个序列
+def batch_update(
+    self,
+    seq_ids: List[int],
+    keys: List[torch.Tensor],
+    values: List[torch.Tensor],
+):
+    """
+    批量更新多个序列的KV Cache
+    """
+    # 合并所有token
+    all_keys = torch.cat(keys, dim=0)
+    all_values = torch.cat(values, dim=0)
+    
+    # 合并所有slot_mapping
+    all_slot_mapping = []
+    for seq_id, key in zip(seq_ids, keys):
+        num_tokens = key.shape[0]
+        for _ in range(num_tokens):
+            block_id, slot_offset = self.block_manager.allocate_slot(seq_id)
+            all_slot_mapping.append(block_id * self.block_size + slot_offset)
+    
+    all_slot_mapping = torch.tensor(all_slot_mapping, device='cuda')
+    
+    # 一次性更新
+    self._scatter_update(all_keys, self.gpu_cache[0], all_slot_mapping)
 ```
 
 ## 5. 实际应用案例
