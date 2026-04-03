@@ -42,11 +42,59 @@ After completing a Q&A session, the skill will:
 
 ## Git Operations
 
-The skill performs the following git operations:
+The skill performs the following git operations **in sequence**:
 - `git status` - Check for changes
+- `git pull` - Sync with remote repository to avoid conflicts
 - `git add .` - Stage all changes
 - `git commit -m "<message>"` - Commit with user-provided message
 - `git push` - Push to remote repository
+
+## Conflict Prevention Rules
+
+**Critical Rule**: Always sync with remote before archiving!
+
+The skill will:
+1. **Always run `git pull` first** to fetch the latest changes from remote
+2. **Detect conflicts automatically** during pull operation
+3. **Provide conflict resolution guidance** if conflicts occur
+4. **Abort archiving** if conflicts cannot be resolved automatically
+5. **Notify user** of the exact files with conflicts
+
+### Conflict Resolution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Archive Process                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. Check Local Changes (git status)                            │
+│         │                                                       │
+│         ▼                                                       │
+│  2. Sync with Remote (git pull)                                 │
+│         │                                                       │
+│         ├─────────────────────┐                                 │
+│         │                     │                                 │
+│         ▼                     ▼                                 │
+│  Conflict?      ┌───────────No───────────┐                     │
+│         │       │                         │                     │
+│         ▼       ▼                         │                     │
+│  Resolve ──────Yes─────► Stage Changes    │                     │
+│  Conflicts      │       (git add .)        │                     │
+│                 │               │         │                     │
+│                 │               ▼         │                     │
+│                 │       Commit Changes     │                     │
+│                 │       (git commit)       │                     │
+│                 │               │         │                     │
+│                 │               ▼         │                     │
+│                 │       Push to Remote     │                     │
+│                 │       (git push)        │                     │
+│                 └───────────────┴─────────┘                     │
+│                                          │                     │
+│                                          ▼                     │
+│                                Archive Complete                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Configuration
 
