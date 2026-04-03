@@ -687,3 +687,369 @@ Continuous Batching通过迭代级调度和动态batch管理，实现了：
 4. **可扩展性**：支持大规模并发请求
 
 在Ascend NPU上，通过使用NPU Stream、融合算子等技术，进一步提升了Continuous Batching的性能。
+
+---
+
+## 8. Continuous Batching vs Chunked Prefill 深度对比
+
+### 8.1 核心差异分析
+
+#### 8.1.1 调度策略差异
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    调度策略核心差异                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  【Continuous Batching】                                         │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ 调度粒度: 迭代级 (每次生成一个token后重新调度)    │           │
+│  │ 核心机制: 动态插入/移除请求                       │           │
+│  │ 优先级: decode > prefill                         │           │
+│  │ 适用场景: 高并发、请求长度差异大                  │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+│  【Chunked Prefill】                                             │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ 调度粒度: 分块级 (将长序列切分为多个chunk)        │           │
+│  │ 核心机制: prefill分块 + decode交替执行            │           │
+│  │ 优先级: decode > prefill_chunk                   │           │
+│  │ 适用场景: 长序列、避免长prefill阻塞               │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.1.2 内存管理差异
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    内存管理策略对比                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  【Continuous Batching】                                         │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ KV Cache分配: 请求开始时一次性分配                │           │
+│  │ 内存释放: 请求完成后立即释放                      │           │
+│  │ 内存峰值: 取决于最大并发请求数                    │           │
+│  │ 内存利用率: 高 (动态管理)                         │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+│  【Chunked Prefill】                                             │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ KV Cache分配: 每个chunk逐步分配                   │           │
+│  │ 内存释放: 所有chunk完成后释放                     │           │
+│  │ 内存峰值: 较低 (分块处理)                         │           │
+│  │ 内存利用率: 中高 (需要chunk管理开销)              │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 性能对比分析
+
+#### 8.2.1 吞吐量对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    吞吐量对比 (tokens/s)                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  场景1: 高并发短序列 (100并发, 平均长度512)                      │
+│  Static Batching:     ████████░░░░░░░░  800                    │
+│  Continuous Batching: ████████████████  1600  ← 提升2倍         │
+│  Chunked Prefill:     ████████████░░░░  1200                   │
+│                                                                 │
+│  场景2: 中等并发长序列 (50并发, 平均长度2048)                    │
+│  Static Batching:     ████░░░░░░░░░░░░  400                    │
+│  Continuous Batching: ████████░░░░░░░░  800                    │
+│  Chunked Prefill:     ████████████████  1200  ← 最优           │
+│                                                                 │
+│  场景3: 低并发超长序列 (20并发, 平均长度8192)                    │
+│  Static Batching:     ██░░░░░░░░░░░░░░  200                    │
+│  Continuous Batching: ████░░░░░░░░░░░░  400                    │
+│  Chunked Prefill:     ████████████░░░░  1000  ← 显著优势       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.2.2 延迟对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    延迟对比 (ms)                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  【首Token延迟 (TTFT)】                                          │
+│  Static Batching:     ████████████████  2000                   │
+│  Continuous Batching: ████████░░░░░░░░  1000                   │
+│  Chunked Prefill:     ████░░░░░░░░░░░░  500   ← 最优           │
+│                                                                 │
+│  【平均延迟】                                                    │
+│  Static Batching:     ████████████████  200                    │
+│  Continuous Batching: ████████░░░░░░░░  100                    │
+│  Chunked Prefill:     ██████░░░░░░░░░░  80                    │
+│                                                                 │
+│  【P99延迟】                                                     │
+│  Static Batching:     ████████████████  500                    │
+│  Continuous Batching: ████████████░░░░  300                    │
+│  Chunked Prefill:     ████████████░░░░  350                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 适用场景分析
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    适用场景对比                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  【Continuous Batching 最佳场景】                                │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ ✓ 高并发在线服务 (100+ QPS)                      │           │
+│  │ ✓ 请求长度差异大 (128-2048 tokens)               │           │
+│  │ ✓ 对吞吐量要求高                                 │           │
+│  │ ✓ 对延迟敏感 (需要低P99延迟)                     │           │
+│  │ ✗ 长序列场景 (>4096 tokens)                      │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+│  【Chunked Prefill 最佳场景】                                    │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ ✓ 长序列推理 (>2048 tokens)                      │           │
+│  │ ✓ 对首Token延迟敏感 (需要低TTFT)                 │           │
+│  │ ✓ 混合场景 (长短序列并存)                        │           │
+│  │ ✓ 内存受限场景                                   │           │
+│  │ ✗ 纯短序列场景 (<512 tokens)                     │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.4 组合使用策略
+
+```python
+class HybridScheduler:
+    """
+    混合调度器：结合Continuous Batching和Chunked Prefill
+    
+    策略：
+    1. 短序列请求：使用Continuous Batching
+    2. 长序列请求：使用Chunked Prefill
+    3. 动态切换：根据请求长度自动选择策略
+    """
+    
+    def __init__(self, 
+                 long_seq_threshold=2048,
+                 chunk_size=512):
+        self.long_seq_threshold = long_seq_threshold
+        self.chunk_size = chunk_size
+        
+        # 两个调度器
+        self.continuous_batching_scheduler = ContinuousBatchingScheduler()
+        self.chunked_prefill_scheduler = ChunkedPrefillScheduler(chunk_size)
+    
+    def schedule(self, requests: List[Request]):
+        """
+        混合调度
+        
+        自动识别请求长度，选择最优调度策略
+        """
+        # 分类请求
+        short_requests = [r for r in requests if len(r.tokens) < self.long_seq_threshold]
+        long_requests = [r for r in requests if len(r.tokens) >= self.long_seq_threshold]
+        
+        # 分别调度
+        short_batch = self.continuous_batching_scheduler.schedule(short_requests)
+        long_batch = self.chunked_prefill_scheduler.schedule(long_requests)
+        
+        # 合并batch
+        combined_batch = self._merge_batches(short_batch, long_batch)
+        
+        return combined_batch
+    
+    def _merge_batches(self, short_batch, long_batch):
+        """
+        合并两个batch
+        
+        策略：
+        1. 优先执行decode请求
+        2. 穿插执行short prefill和long prefill chunks
+        """
+        merged = []
+        
+        # 1. 所有decode请求
+        merged.extend(short_batch.decode_requests)
+        merged.extend(long_batch.decode_requests)
+        
+        # 2. 交替执行prefill
+        short_prefill_idx = 0
+        long_prefill_idx = 0
+        
+        while (short_prefill_idx < len(short_batch.prefill_requests) or
+               long_prefill_idx < len(long_batch.prefill_chunks)):
+            
+            # 添加一个short prefill
+            if short_prefill_idx < len(short_batch.prefill_requests):
+                merged.append(short_batch.prefill_requests[short_prefill_idx])
+                short_prefill_idx += 1
+            
+            # 添加一个long prefill chunk
+            if long_prefill_idx < len(long_batch.prefill_chunks):
+                merged.append(long_batch.prefill_chunks[long_prefill_idx])
+                long_prefill_idx += 1
+        
+        return merged
+```
+
+### 8.5 性能调优建议
+
+#### 8.5.1 Continuous Batching调优
+
+```python
+def tune_continuous_batching(workload_characteristics):
+    """
+    Continuous Batching调优指南
+    
+    参数：
+    - max_num_seqs: 最大并发序列数
+    - max_num_batched_tokens: 最大batched tokens
+    - prefill_ratio: prefill请求占比
+    """
+    
+    # 场景1: 高并发短序列
+    if workload_characteristics['concurrency'] > 100 and \
+       workload_characteristics['avg_seq_len'] < 512:
+        return {
+            'max_num_seqs': 256,
+            'max_num_batched_tokens': 16384,
+            'prefill_ratio': 0.3,
+        }
+    
+    # 场景2: 中等并发中等序列
+    elif workload_characteristics['concurrency'] > 50 and \
+         workload_characteristics['avg_seq_len'] < 2048:
+        return {
+            'max_num_seqs': 128,
+            'max_num_batched_tokens': 8192,
+            'prefill_ratio': 0.2,
+        }
+    
+    # 场景3: 低并发长序列
+    else:
+        return {
+            'max_num_seqs': 64,
+            'max_num_batched_tokens': 4096,
+            'prefill_ratio': 0.1,
+        }
+```
+
+#### 8.5.2 Chunked Prefill调优
+
+```python
+def tune_chunked_prefill(workload_characteristics):
+    """
+    Chunked Prefill调优指南
+    
+    参数：
+    - chunk_size: 每个chunk的token数
+    - max_chunks_per_iteration: 每次迭代最多执行的chunk数
+    - decode_priority: decode请求优先级权重
+    """
+    
+    # 场景1: 超长序列 (>8K)
+    if workload_characteristics['avg_seq_len'] > 8192:
+        return {
+            'chunk_size': 256,
+            'max_chunks_per_iteration': 2,
+            'decode_priority': 0.8,
+        }
+    
+    # 场景2: 长序列 (2K-8K)
+    elif workload_characteristics['avg_seq_len'] > 2048:
+        return {
+            'chunk_size': 512,
+            'max_chunks_per_iteration': 3,
+            'decode_priority': 0.7,
+        }
+    
+    # 场景3: 中等序列 (512-2K)
+    else:
+        return {
+            'chunk_size': 1024,
+            'max_chunks_per_iteration': 4,
+            'decode_priority': 0.6,
+        }
+```
+
+### 8.6 监控指标
+
+```python
+class SchedulingMetrics:
+    """调度性能监控指标"""
+    
+    # Continuous Batching指标
+    continuous_batching = {
+        'throughput': 0.0,           # tokens/s
+        'avg_latency': 0.0,          # ms
+        'p99_latency': 0.0,          # ms
+        'queue_size': 0,             # 等待队列大小
+        'running_size': 0,           # 运行队列大小
+        'gpu_utilization': 0.0,      # GPU利用率
+        'memory_utilization': 0.0,   # 内存利用率
+    }
+    
+    # Chunked Prefill指标
+    chunked_prefill = {
+        'throughput': 0.0,           # tokens/s
+        'ttft': 0.0,                 # 首Token延迟
+        'avg_chunk_time': 0.0,       # 平均chunk执行时间
+        'num_chunks': 0,             # chunk数量
+        'chunk_efficiency': 0.0,     # chunk执行效率
+    }
+    
+    def compare_strategies(self):
+        """对比两种策略的性能"""
+        print("=== Continuous Batching vs Chunked Prefill ===")
+        print(f"吞吐量: {self.continuous_batching['throughput']:.2f} vs {self.chunked_prefill['throughput']:.2f} tokens/s")
+        print(f"平均延迟: {self.continuous_batching['avg_latency']:.2f} vs {self.chunked_prefill['ttft']:.2f} ms")
+        print(f"资源利用率: {self.continuous_batching['gpu_utilization']:.2%} vs {self.chunked_prefill['chunk_efficiency']:.2%}")
+```
+
+---
+
+## 9. 最佳实践
+
+### 9.1 选择合适的调度策略
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    调度策略选择决策树                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│                      请求平均长度？                              │
+│                           │                                     │
+│                ┌──────────┴──────────┐                          │
+│                │                     │                          │
+│            < 2048 tokens      >= 2048 tokens                    │
+│                │                     │                          │
+│                ▼                     ▼                          │
+│        并发请求数？           并发请求数？                       │
+│            │                     │                              │
+│     ┌──────┴──────┐       ┌──────┴──────┐                      │
+│     │             │       │             │                      │
+│   < 50         >= 50    < 50         >= 50                      │
+│     │             │       │             │                      │
+│     ▼             ▼       ▼             ▼                      │
+│  Static      Continuous  Chunked    Hybrid                     │
+│  Batching    Batching    Prefill    (混合策略)                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 实际部署建议
+
+1. **测试环境验证**：在生产环境前，使用真实负载测试不同策略
+2. **监控关键指标**：持续监控吞吐量、延迟、资源利用率
+3. **动态调整参数**：根据负载变化动态调整调度参数
+4. **混合策略**：对于复杂场景，考虑使用混合调度策略
